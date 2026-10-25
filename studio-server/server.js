@@ -92,7 +92,7 @@ const DEFAULT_SCENES = [
     narration:
       "Clicking 'Inject bug' corrupts the in-memory runtime. The source viewer immediately highlights line two of calculateCartTotal, showing that discount is now incorrectly assigned the raw rate value of zero-point-one instead of the result of multiplying it by the subtotal. The demo store total jumps from the correct eighty-six forty to the wrong ninety-five ninety.",
     action: "click",
-    selector: ".button-primary",
+    selector: 'button:has-text("Inject bug")',
   },
   {
     id: "run-tests",
@@ -103,7 +103,7 @@ const DEFAULT_SCENES = [
     narration:
       "The local test engine runs three assertions in under a millisecond. Two tests pass. The third fails: 'cart total applies percentage discount' expected eighty-six forty but received ninety-five ninety. The failure is deterministic, reproducible every single time.",
     action: "click",
-    selector: ".run-button",
+    selector: 'button:has-text("Run tests")',
   },
   {
     id: "investigate",
@@ -114,7 +114,7 @@ const DEFAULT_SCENES = [
     narration:
       "Clicking 'Investigate root cause' triggers PatchPilot's diagnostic engine. It identifies the exact function, classifies the severity as high, explains that the discount rate was treated as currency rather than a multiplier, and shows the mathematical discrepancy: the correct deduction is nine dollars sixty, but the faulty version only subtracted ten cents.",
     action: "click",
-    selector: ".button-secondary",
+    selector: 'button:has-text("Investigate root cause")',
   },
   {
     id: "patch-review",
@@ -136,7 +136,7 @@ const DEFAULT_SCENES = [
     narration:
       "Clicking 'Approve patch' stages the corrected logic in memory. The source viewer updates to show the healthy version of the function. The demo store cart recalculates instantly, reverting from ninety-five ninety back to the expected eighty-six forty.",
     action: "click",
-    selector: ".approve-button",
+    selector: 'button:has-text("Approve patch")',
   },
   {
     id: "verify",
@@ -147,7 +147,7 @@ const DEFAULT_SCENES = [
     narration:
       "Clicking 'Verify fix' reruns the complete regression suite against the patched runtime. All three assertions go green. The activity stream logs the recovery event. The status badge transitions to Recovered. The fix is proven, not assumed.",
     action: "click",
-    selector: ".approve-button",
+    selector: 'button:has-text("Verify fix")',
   },
   {
     id: "summary",
@@ -254,10 +254,22 @@ async function runRecordingJob(job, scenes, targetUrl, viewport, jobDir, audioDi
     let playwright, browser, page;
     try {
       playwright = require("playwright");
-      browser = await playwright.chromium.launch({
+      const launchOpts = {
         headless: true,
         args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-gpu"],
-      });
+      };
+      try {
+        browser = await playwright.chromium.launch(launchOpts);
+        log("Browser: launched bundled chromium");
+      } catch (err1) {
+        try {
+          browser = await playwright.chromium.launch({ ...launchOpts, channel: "chrome" });
+          log("Browser: launched system Google Chrome");
+        } catch (err2) {
+          browser = await playwright.chromium.launch({ ...launchOpts, channel: "msedge" });
+          log("Browser: launched system Microsoft Edge");
+        }
+      }
       const ctx = await browser.newContext({
         viewport,
         colorScheme: "dark",
@@ -265,7 +277,7 @@ async function runRecordingJob(job, scenes, targetUrl, viewport, jobDir, audioDi
       });
       page = await ctx.newPage();
     } catch (e) {
-      throw new Error(`Playwright launch failed: ${e.message}. Run: npx playwright install chromium`);
+      throw new Error(`Playwright launch failed: ${e.message}`);
     }
 
     log(`Navigating to ${targetUrl}`);
@@ -429,18 +441,17 @@ async function performSceneAction(page, scene, log) {
 // ─── TTS ──────────────────────────────────────────────────────────────────────
 
 async function generateTTS(text, outputPath, log) {
-  // Try edge-tts-node (Microsoft Edge TTS, free, no API key)
-  return new Promise((resolve, reject) => {
-    try {
-      const edgeTTS = require("edge-tts-node");
-      const tts = new edgeTTS.EdgeTTS();
-      tts.ttsPromise(text, outputPath, { voice: "en-US-GuyNeural", rate: "+0%", pitch: "+0Hz" })
-        .then(() => resolve())
-        .catch(reject);
-    } catch (e) {
-      reject(new Error(`edge-tts-node failed: ${e.message}`));
-    }
-  });
+  try {
+    const googleTTS = require("google-tts-api");
+    const results = await googleTTS.getAllAudioBase64(text, { lang: "en", slow: false, timeout: 15000 });
+    const bufs = results.map((r) => Buffer.from(r.base64, "base64"));
+    const combined = Buffer.concat(bufs);
+    fs.writeFileSync(outputPath, combined);
+    log(`TTS generated: ${combined.length} bytes`);
+    return outputPath;
+  } catch (e) {
+    throw new Error(`TTS generation failed: ${e.message}`);
+  }
 }
 
 async function generateSilence(durationSec, outputPath, ffmpegPath, log) {
@@ -520,9 +531,6 @@ function detectFfmpeg() {
 }
 
 async function assembleFfmpegVideo(capturedScenes, audioSegments, ffmpegPath, jobDir, outputPath, srtPath, viewport, log) {
-  const fluentFfmpeg = require("fluent-ffmpeg");
-  fluentFfmpeg.setFfmpegPath(ffmpegPath);
-
   // Build per-scene video segments then concatenate
   const segmentPaths = [];
 
@@ -533,38 +541,58 @@ async function assembleFfmpegVideo(capturedScenes, audioSegments, ffmpegPath, jo
 
     log(`Rendering segment ${i + 1}/${capturedScenes.length}: ${scene.title}`);
 
-    await new Promise((resolve, reject) => {
-      const framePattern = path.join(jobDir, `scene${String(i).padStart(2, "0")}_frame%04d.png`);
+    const framePattern = path.join(jobDir, `scene${String(i).padStart(2, "0")}_frame%04d.png`);
+    const firstFrame = scene.frames && scene.frames[0];
+    if (!firstFrame || !fs.existsSync(firstFrame)) {
+      log(`No frames for scene ${i + 1} — skipping segment`);
+      continue;
+    }
 
-      // Check if frames exist
-      const firstFrame = scene.frames && scene.frames[0];
-      if (!firstFrame || !fs.existsSync(firstFrame)) {
-        log(`No frames for scene ${i + 1} — skipping segment`);
-        return resolve();
-      }
+    const fps = Math.max(1, scene.frames.length / scene.duration);
 
-      const fps = Math.max(1, scene.frames.length / scene.duration);
-      let cmd = fluentFfmpeg()
-        .input(framePattern)
-        .inputFPS(fps)
-        .videoCodec("libx264")
-        .outputOptions(["-pix_fmt", "yuv420p", "-preset", "ultrafast", "-crf", "23"]);
-
-      if (audio.audioPath && fs.existsSync(audio.audioPath) && fs.statSync(audio.audioPath).size > 100) {
-        cmd = cmd.input(audio.audioPath).audioCodec("aac").outputOptions(["-shortest"]);
+    await new Promise((resolve) => {
+      let args;
+      const hasAudio = audio?.audioPath && fs.existsSync(audio.audioPath) && fs.statSync(audio.audioPath).size > 100;
+      if (hasAudio) {
+        args = [
+          "-y",
+          "-framerate", String(fps),
+          "-i", framePattern,
+          "-i", audio.audioPath,
+          "-c:v", "libx264",
+          "-pix_fmt", "yuv420p",
+          "-preset", "ultrafast",
+          "-crf", "23",
+          "-c:a", "aac",
+          "-b:a", "128k",
+          "-shortest",
+          segmentPath,
+        ];
       } else {
-        // Add silence so segment has audio track
-        cmd = cmd
-          .input("anullsrc=r=44100:cl=stereo")
-          .inputFormat("lavfi")
-          .audioCodec("aac")
-          .outputOptions(["-t", String(scene.duration)]);
+        args = [
+          "-y",
+          "-framerate", String(fps),
+          "-i", framePattern,
+          "-f", "lavfi",
+          "-i", "anullsrc=r=44100:cl=stereo",
+          "-c:v", "libx264",
+          "-pix_fmt", "yuv420p",
+          "-preset", "ultrafast",
+          "-crf", "23",
+          "-c:a", "aac",
+          "-t", String(scene.duration),
+          segmentPath,
+        ];
       }
 
-      cmd.output(segmentPath)
-        .on("end", () => { segmentPaths.push(segmentPath); resolve(); })
-        .on("error", (e) => { log(`FFmpeg error on segment ${i}: ${e.message}`); resolve(); })
-        .run();
+      execFile(ffmpegPath, args, (err, stdout, stderr) => {
+        if (err) {
+          log(`FFmpeg error on segment ${i}: ${err.message}`);
+        } else {
+          segmentPaths.push(segmentPath);
+        }
+        resolve();
+      });
     });
   }
 
@@ -576,16 +604,26 @@ async function assembleFfmpegVideo(capturedScenes, audioSegments, ffmpegPath, jo
   fs.writeFileSync(concatList, segmentPaths.map((p) => `file '${p.replace(/\\/g, "/")}'`).join("\n"));
 
   await new Promise((resolve, reject) => {
-    fluentFfmpeg()
-      .input(concatList)
-      .inputOptions(["-f", "concat", "-safe", "0"])
-      .videoCodec("libx264")
-      .audioCodec("aac")
-      .outputOptions(["-pix_fmt", "yuv420p", "-movflags", "+faststart", "-preset", "fast", "-crf", "22"])
-      .output(outputPath)
-      .on("end", resolve)
-      .on("error", (e) => reject(new Error(`Concat failed: ${e.message}`)))
-      .run();
+    const concatArgs = [
+      "-y",
+      "-f", "concat",
+      "-safe", "0",
+      "-i", concatList,
+      "-c:v", "libx264",
+      "-c:a", "aac",
+      "-pix_fmt", "yuv420p",
+      "-movflags", "+faststart",
+      "-preset", "fast",
+      "-crf", "22",
+      outputPath,
+    ];
+    execFile(ffmpegPath, concatArgs, (err, stdout, stderr) => {
+      if (err) {
+        reject(new Error(`Concat failed: ${err.message}\n${stderr || ""}`));
+      } else {
+        resolve();
+      }
+    });
   });
 }
 
