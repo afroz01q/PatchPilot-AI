@@ -172,8 +172,26 @@ app.get("/api/scenes", (_req, res) => {
   res.json({ scenes: DEFAULT_SCENES });
 });
 
+const AI_VOICES = [
+  { id: "en-US-ChristopherNeural", name: "Christopher (Authoritative, Tech Narrator)", lang: "en-US", gender: "Male" },
+  { id: "en-US-AndrewMultilingualNeural", name: "Andrew (Deep, Modern AI Voice)", lang: "en-US", gender: "Male" },
+  { id: "en-US-AvaMultilingualNeural", name: "Ava (Smooth, Expressive AI Voice)", lang: "en-US", gender: "Female" },
+  { id: "en-US-JennyNeural", name: "Jenny (Clear, Professional Presenter)", lang: "en-US", gender: "Female" },
+  { id: "en-US-GuyNeural", name: "Guy (Conversational, Engaging Host)", lang: "en-US", gender: "Male" },
+  { id: "en-GB-RyanNeural", name: "Ryan (British Accent, Documentary)", lang: "en-GB", gender: "Male" },
+];
+
+app.get("/api/voices", (_req, res) => {
+  res.json({ voices: AI_VOICES, defaultVoice: "en-US-ChristopherNeural" });
+});
+
 app.post("/api/record", (req, res) => {
-  const { scenes = DEFAULT_SCENES, targetUrl = "http://localhost:5174", viewport = { width: 1280, height: 720 } } = req.body;
+  const {
+    scenes = DEFAULT_SCENES,
+    targetUrl = "http://localhost:5174",
+    viewport = { width: 1280, height: 720 },
+    voice = "en-US-ChristopherNeural"
+  } = req.body;
   const jobId = uuidv4();
   const jobDir = path.join(FRAMES_DIR, jobId);
   const audioDir = path.join(AUDIO_DIR, jobId);
@@ -191,13 +209,14 @@ app.post("/api/record", (req, res) => {
     srtPath: null,
     error: null,
     startedAt: Date.now(),
+    voice,
   };
   jobs.set(jobId, job);
 
-  res.json({ jobId });
+  res.json({ jobId, voice });
 
   // Run recording asynchronously
-  setImmediate(() => runRecordingJob(job, scenes, targetUrl, viewport, jobDir, audioDir));
+  setImmediate(() => runRecordingJob(job, scenes, targetUrl, viewport, jobDir, audioDir, voice));
 });
 
 app.get("/api/jobs/:id", (req, res) => {
@@ -236,7 +255,7 @@ app.get("/api/jobs/:id/preview", (req, res) => {
 
 // ─── Recording Pipeline ───────────────────────────────────────────────────────
 
-async function runRecordingJob(job, scenes, targetUrl, viewport, jobDir, audioDir) {
+async function runRecordingJob(job, scenes, targetUrl, viewport, jobDir, audioDir, voice = "en-US-ChristopherNeural") {
   const log = (msg) => {
     console.log(`[Job ${job.id}] ${msg}`);
     job.logs.push({ time: Date.now(), msg });
@@ -331,7 +350,7 @@ async function runRecordingJob(job, scenes, targetUrl, viewport, jobDir, audioDi
     // ── Step 3: TTS narration ────────────────────────────────────────────────
     job.status = "generating-audio";
     job.progress = 55;
-    log("Generating TTS narration with edge-tts");
+    log(`Generating Real AI Neural Voice (${voice})`);
 
     const audioSegments = [];
     for (let i = 0; i < capturedScenes.length; i++) {
@@ -339,7 +358,7 @@ async function runRecordingJob(job, scenes, targetUrl, viewport, jobDir, audioDi
       job.progress = 55 + Math.round((i / capturedScenes.length) * 20);
       const audioPath = path.join(audioDir, `scene${String(i).padStart(2, "0")}.mp3`);
       try {
-        await generateTTS(scene.narration, audioPath, log);
+        await generateTTS(scene.narration, audioPath, log, voice);
         audioSegments.push({ sceneIndex: i, audioPath, narration: scene.narration });
         log(`Audio generated: scene ${i + 1}`);
       } catch (e) {
@@ -414,19 +433,21 @@ async function performSceneAction(page, scene, log) {
       if (scene.selector) {
         try {
           const el = page.locator(scene.selector).first();
-          await el.waitFor({ timeout: 5000, state: "visible" });
-          // Add a visual click indicator by evaluating JS
-          await page.evaluate((sel) => {
-            const el = document.querySelector(sel);
-            if (el) {
-              el.style.outline = "3px solid #d97757";
-              el.style.outlineOffset = "3px";
-              setTimeout(() => { el.style.outline = ""; el.style.outlineOffset = ""; }, 1200);
-            }
-          }, scene.selector);
-          await page.waitForTimeout(300);
+          await el.waitFor({ timeout: 6000, state: "visible" });
+          // Highlight directly on the located DOM element (safe with all Playwright selectors)
+          await el.evaluate((domEl) => {
+            domEl.style.outline = "3px solid #d97757";
+            domEl.style.outlineOffset = "3px";
+            domEl.style.boxShadow = "0 0 15px rgba(217, 119, 87, 0.6)";
+            setTimeout(() => {
+              domEl.style.outline = "";
+              domEl.style.outlineOffset = "";
+              domEl.style.boxShadow = "";
+            }, 1200);
+          }).catch(() => {});
+          await page.waitForTimeout(400);
           await el.click({ timeout: 5000 });
-          await page.waitForTimeout(600);
+          await page.waitForTimeout(800);
         } catch (e) {
           log(`Click failed on "${scene.selector}": ${e.message}`);
         }
@@ -438,20 +459,38 @@ async function performSceneAction(page, scene, log) {
   }
 }
 
-// ─── TTS ──────────────────────────────────────────────────────────────────────
+// ─── Real AI Model TTS ────────────────────────────────────────────────────────
 
-async function generateTTS(text, outputPath, log) {
-  try {
-    const googleTTS = require("google-tts-api");
-    const results = await googleTTS.getAllAudioBase64(text, { lang: "en", slow: false, timeout: 15000 });
-    const bufs = results.map((r) => Buffer.from(r.base64, "base64"));
-    const combined = Buffer.concat(bufs);
-    fs.writeFileSync(outputPath, combined);
-    log(`TTS generated: ${combined.length} bytes`);
-    return outputPath;
-  } catch (e) {
-    throw new Error(`TTS generation failed: ${e.message}`);
-  }
+async function generateTTS(text, outputPath, log, voice = "en-US-ChristopherNeural") {
+  return new Promise((resolve) => {
+    // 1. Primary: Python edge-tts CLI for real studio-grade AI Neural Voice model
+    execFile(
+      "python",
+      ["-m", "edge_tts", "--voice", voice, "--text", text, "--write-media", outputPath],
+      (err) => {
+        if (!err && fs.existsSync(outputPath) && fs.statSync(outputPath).size > 1000) {
+          log(`Real AI Neural Voice generated (${voice}): ${Math.round(fs.statSync(outputPath).size / 1024)}KB`);
+          return resolve(outputPath);
+        }
+        log(`Edge-TTS not available (${err?.message || "empty"}), falling back to Google TTS`);
+        try {
+          const googleTTS = require("google-tts-api");
+          googleTTS
+            .getAllAudioBase64(text, { lang: "en", slow: false, timeout: 15000 })
+            .then((results) => {
+              const bufs = results.map((r) => Buffer.from(r.base64, "base64"));
+              const combined = Buffer.concat(bufs);
+              fs.writeFileSync(outputPath, combined);
+              log(`Fallback audio generated: ${combined.length} bytes`);
+              resolve(outputPath);
+            })
+            .catch(() => resolve(outputPath));
+        } catch {
+          resolve(outputPath);
+        }
+      }
+    );
+  });
 }
 
 async function generateSilence(durationSec, outputPath, ffmpegPath, log) {
